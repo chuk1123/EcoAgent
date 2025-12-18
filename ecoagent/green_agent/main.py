@@ -103,12 +103,31 @@ def list_agents():
             "id": agent_id,
             "name": "EcoAgent Green Agent",
             "url": PUBLIC_URL,
-            "status": "running",
+            "status": "ready",
+            "ready": True,
             "agent_card": get_agent_card()
         }
+    }
+
+# AgentBeats per-agent status endpoint
+@app.get("/agents/{agent_id}")
+def get_agent_status(agent_id: str):
+    return {
+        "id": agent_id,
+        "name": "EcoAgent Green Agent",
+        "url": PUBLIC_URL,
+        "status": "ready",
+        "ready": True,
+        "agent_card": get_agent_card()
     }
 
 @app.post("/reset")
 def reset_agent():
     green_agent.reset()
     return {"status": "state reset", "budget_restored": green_agent.budget.max}
+
+# AgentBeats reset endpoint (per-agent path)
+@app.post("/agents/{agent_id}/reset")
+def reset_agent_by_id(agent_id: str):
+    green_agent.reset()
+    return {"status": "ok", "agent_id": agent_id, "message": "Agent reset successfully"}

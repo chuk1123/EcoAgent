@@ -109,9 +109,23 @@ def list_agents():
             "id": agent_id,
             "name": "EcoAgent White Agent",
             "url": public_url,
-            "status": "running",
+            "status": "ready",
+            "ready": True,
             "agent_card": get_agent_card()
         }
+    }
+
+# AgentBeats per-agent status endpoint
+@app.get("/agents/{agent_id}")
+def get_agent_status(agent_id: str):
+    public_url = os.getenv("PUBLIC_URL", "http://localhost:9001")
+    return {
+        "id": agent_id,
+        "name": "EcoAgent White Agent",
+        "url": public_url,
+        "status": "ready",
+        "ready": True,
+        "agent_card": get_agent_card()
     }
 
 def get_agent_card():
@@ -143,3 +157,13 @@ def agent_card_a2a():
 def agent_card_legacy():
     from fastapi.responses import JSONResponse
     return JSONResponse(content=get_agent_card(), media_type="application/json")
+
+# Reset endpoints
+@app.post("/reset")
+def reset_agent():
+    return {"status": "ok", "message": "Agent reset successfully"}
+
+# AgentBeats reset endpoint (per-agent path)
+@app.post("/agents/{agent_id}/reset")
+def reset_agent_by_id(agent_id: str):
+    return {"status": "ok", "agent_id": agent_id, "message": "Agent reset successfully"}
