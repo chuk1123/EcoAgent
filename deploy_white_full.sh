@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # Deploy White Agent with AgentBeats Controller + Cloudflare Tunnel
-# All-in-one script
+# All-in-one script - Deploys BOTH agents (Linear Regression + Naive Last Value)
 # =============================================================================
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -10,7 +10,9 @@ cd "${SCRIPT_DIR}"
 CTRL_PORT=8011
 TUNNEL_LOG="/tmp/cloudflare_tunnel_white_ctrl.log"
 
-echo "🚀 Deploying White Agent with AgentBeats Controller..."
+echo "🚀 Deploying White Agents with AgentBeats Controller..."
+echo "   - Linear Regression Agent"
+echo "   - Naive Last Value Agent"
 
 # Cleanup function
 cleanup() {
@@ -26,6 +28,9 @@ cleanup() {
     exit 0
 }
 trap cleanup SIGINT SIGTERM
+
+# Clean up stale agent state to prevent errors
+rm -rf "${SCRIPT_DIR}/.ab"
 
 # Use the venv with earthshaker
 source "${SCRIPT_DIR}/venv-ctrl/bin/activate"
@@ -87,8 +92,12 @@ fi
 
 echo ""
 echo "=============================================="
-echo "✅ White Agent Controller Deployed!"
+echo "✅ White Agents Controller Deployed!"
 echo "=============================================="
+echo ""
+echo "🤖 Available Agents:"
+echo "   • linear-regression  - Linear Regression Agent"
+echo "   • naive-last-value   - Naive Last Value Agent"
 echo ""
 echo "🔗 Controller URL: $TUNNEL_URL"
 echo ""
@@ -99,4 +108,3 @@ echo ""
 
 # Keep running
 wait $CTRL_PID
-

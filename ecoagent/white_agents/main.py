@@ -64,29 +64,86 @@ app = FastAPI()
 # Add CORS middleware for AgentBeats platform
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 GREEN_AGENT_URL = os.getenv("GREEN_AGENT_URL")
-TARGET_AGENT_MODULE = "ecoagent.white_agents.react_agent"
 
-@app.post("/v1/chat/completions")
-async def start_assessment(request: Request):
-    proxy = GreenAgentProxy(GREEN_AGENT_URL)
+# =============================================================================
+# Two agents: Linear Regression and Naive Last Value (no LLM required)
+# =============================================================================
+AGENTS = {
+    "linear-regression": {
+        "module": "ecoagent.white_agents.two_feature_regression",
+        "name": "Linear Regression Agent",
+        "description": "Uses sklearn LinearRegression with median listing price as feature.",
+    },
+    "naive-last-value": {
+        "module": "ecoagent.white_agents.naive_last_value",
+        "name": "Naive Last Value Agent",
+        "description": "Simple baseline that predicts the last observed training value.",
+    },
+}
+
+def run_agent(agent_id: str, green_agent_url: str):
+    """Run a specific agent and return results."""
+    if agent_id not in AGENTS:
+        raise ValueError(f"Unknown agent: {agent_id}")
+    
+    proxy = GreenAgentProxy(green_agent_url)
+    agent_module = import_module(AGENTS[agent_id]["module"])
+    importlib.reload(agent_module)
+    return agent_module.run(proxy)
+
+def get_agent_card(agent_id: str):
+    """Generate agent card for a specific agent."""
+    public_url = os.getenv("PUBLIC_URL", "http://localhost:9001")
+    agent = AGENTS[agent_id]
+    return {
+        "name": agent["name"],
+        "version": "1.0.0",
+        "protocolVersion": "0.3.0",
+        "description": f"White Agent for EcoAgent (A2A). {agent['description']}",
+        "url": f"{public_url}/agents/{agent_id}/",
+        "defaultInputModes": ["text"],
+        "defaultOutputModes": ["text"],
+        "skills": [],
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "stateTransitionHistory": False
+        }
+    }
+
+# =============================================================================
+# Per-agent chat completions endpoint
+# =============================================================================
+@app.post("/agents/{agent_id}/v1/chat/completions")
+async def agent_chat(agent_id: str, request: Request):
+    if agent_id not in AGENTS:
+        return {"choices": [{"message": {"content": json.dumps({"error": f"Unknown agent: {agent_id}"})}}]}
     
     try:
-        agent_module = import_module(TARGET_AGENT_MODULE)
-        importlib.reload(agent_module)
-        
-        result = agent_module.run(proxy)
-        
+        result = run_agent(agent_id, GREEN_AGENT_URL)
         result_json = json.dumps(result, cls=NumpyEncoder)
-        
         return {"choices": [{"message": {"content": result_json}}]}
+    except Exception as e:
+        print(f"Error in {agent_id} execution: {e}")
+        return {"choices": [{"message": {"content": json.dumps({"error": str(e)})}}]}
 
+# =============================================================================
+# Legacy endpoint (runs first agent by default)
+# =============================================================================
+@app.post("/v1/chat/completions")
+async def start_assessment(request: Request):
+    default_agent = list(AGENTS.keys())[0]
+    try:
+        result = run_agent(default_agent, GREEN_AGENT_URL)
+        result_json = json.dumps(result, cls=NumpyEncoder)
+        return {"choices": [{"message": {"content": result_json}}]}
     except Exception as e:
         print(f"Error in white agent execution: {e}")
         return {"choices": [{"message": {"content": json.dumps({"error": str(e)})}}]}
@@ -99,71 +156,63 @@ def health():
 def status():
     return {"status": "ok"}
 
-# AgentBeats controller endpoint - returns dict of agent instances
+# =============================================================================
+# AgentBeats controller endpoints - list ALL agents
+# =============================================================================
 @app.get("/agents")
 def list_agents():
-    agent_id = "white-agent-react"
     public_url = os.getenv("PUBLIC_URL", "http://localhost:9001")
-    return {
-        agent_id: {
+    result = {}
+    for agent_id in AGENTS:
+        result[agent_id] = {
             "id": agent_id,
-            "name": "EcoAgent White Agent",
-            "url": public_url,
+            "name": AGENTS[agent_id]["name"],
+            "url": f"{public_url}/agents/{agent_id}",
             "status": "ready",
             "ready": True,
-            "agent_card": get_agent_card()
+            "agent_card": get_agent_card(agent_id)
         }
-    }
+    return result
 
-# AgentBeats per-agent status endpoint
 @app.get("/agents/{agent_id}")
 def get_agent_status(agent_id: str):
+    if agent_id not in AGENTS:
+        return {"error": f"Unknown agent: {agent_id}"}
+    
     public_url = os.getenv("PUBLIC_URL", "http://localhost:9001")
     return {
         "id": agent_id,
-        "name": "EcoAgent White Agent",
-        "url": public_url,
+        "name": AGENTS[agent_id]["name"],
+        "url": f"{public_url}/agents/{agent_id}",
         "status": "ready",
         "ready": True,
-        "agent_card": get_agent_card()
+        "agent_card": get_agent_card(agent_id)
     }
 
-def get_agent_card():
-    public_url = os.getenv("PUBLIC_URL", "http://localhost:9001")
-    return {
-        "name": "EcoAgent White Agent",
-        "version": "1.0.0",
-        "protocolVersion": "0.3.0",
-        "description": "White Agent for EcoAgent (A2A). ReAct-based agent for resource-constrained housing forecasting.",
-        "url": public_url + "/",
-        "defaultInputModes": ["text"],
-        "defaultOutputModes": ["text"],
-        "skills": [],
-        "capabilities": {
-            "streaming": False,
-            "pushNotifications": False,
-            "stateTransitionHistory": False
-        }
-    }
-
-# A2A Protocol standard path
+# =============================================================================
+# A2A Protocol agent cards
+# =============================================================================
 @app.get("/.well-known/agent.json")
 def agent_card_a2a():
+    """Returns first agent's card for legacy compatibility."""
     from fastapi.responses import JSONResponse
-    return JSONResponse(content=get_agent_card(), media_type="application/json")
+    default_agent = list(AGENTS.keys())[0]
+    return JSONResponse(content=get_agent_card(default_agent), media_type="application/json")
 
-# Legacy path for backwards compatibility
-@app.get("/.well-known/agent-card.json")
-def agent_card_legacy():
+@app.get("/agents/{agent_id}/.well-known/agent.json")
+def agent_card_by_id(agent_id: str):
     from fastapi.responses import JSONResponse
-    return JSONResponse(content=get_agent_card(), media_type="application/json")
+    if agent_id not in AGENTS:
+        return JSONResponse(content={"error": f"Unknown agent: {agent_id}"}, status_code=404)
+    return JSONResponse(content=get_agent_card(agent_id), media_type="application/json")
 
+# =============================================================================
 # Reset endpoints
+# =============================================================================
 @app.post("/reset")
 def reset_agent():
-    return {"status": "ok", "message": "Agent reset successfully"}
+    return {"status": "ok", "message": "All agents reset successfully"}
 
-# AgentBeats reset endpoint (per-agent path)
 @app.post("/agents/{agent_id}/reset")
 def reset_agent_by_id(agent_id: str):
     return {"status": "ok", "agent_id": agent_id, "message": "Agent reset successfully"}
