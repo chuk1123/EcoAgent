@@ -1,0 +1,30 @@
+datasets:
+  - id: target
+    columns: ["Year", "Vacant Units"]
+
+  - id: total_housing_units
+    columns: ["Year", "Total Housing Units"]
+
+  - id: occupied_units
+    columns: ["Year", "Occupied Units"]
+
+  - id: vacant_units
+    columns: ["Year", "Vacant Units"]
+
+  - id: median_listing_price
+    columns: ["Year", "Median Listing Price (US dollars)"]
+
+  - id: population
+    columns: ["Year", "Total Population"]
+
+  - id: median_age
+    columns: ["Year", "Median Age (years)"]
+
+  - id: homeless_total
+    columns: ["Year", "Homeless Total"]
+
+  - id: median_income
+    columns: ["Year", "Median Household Income (inflation-adjusted US dollars)"]
+  
+  - id: poverty_rate
+    columns: ["Year", "Percentage of Population at or below the Poverty Level"]

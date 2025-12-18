@@ -1,0 +1,13 @@
+context_id: housing-trends
+target: Vacant Units
+horizon: 1
+budget:
+  max_datasets: 2
+scoring:
+  metric: rmse
+  mode: bonus
+  alpha_accuracy: 0.7
+  beta_efficiency: 0.3 
+leakage_guard_test_block:
+  - target
+  - vacant_units

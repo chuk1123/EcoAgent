@@ -1,0 +1,12 @@
+agents:
+  green_agent:
+    model_name: gpt-4o-mini
+    provider: openai
+  white_agent:
+    max_calls: 20
+    model_name: gpt-4o-mini
+    provider: openai
+api_keys:
+  anthropic: YOUR_ANTHROPIC_API_KEY
+  google: YOUR_GOOGLE_API_KEY
+  openai: YOUR_OPENAI_API_KEY
