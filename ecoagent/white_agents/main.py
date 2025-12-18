@@ -9,6 +9,8 @@ from importlib import import_module
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
+AGENT_ID = "react-agent"
+
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.integer):
@@ -86,6 +88,16 @@ AGENTS = {
         "name": "Naive Last Value Agent",
         "description": "Simple baseline that predicts the last observed training value.",
     },
+    "react-agent": {
+        "module": "ecoagent.white_agents.react_agent",
+        "name": "React Agent",
+        "description": "Uses React to build a web application.",
+    },
+    "plan-execute-agent": {
+        "module": "ecoagent.white_agents.plan_execute_agent",
+        "name": "Plan-Execute Agent",
+        "description": "Two-phase agent that first creates a plan, then executes it step by step.",
+    },
 }
 
 def run_agent(agent_id: str, green_agent_url: str):
@@ -139,7 +151,7 @@ async def agent_chat(agent_id: str, request: Request):
 # =============================================================================
 @app.post("/v1/chat/completions")
 async def start_assessment(request: Request):
-    default_agent = list(AGENTS.keys())[0]
+    default_agent = AGENT_ID
     try:
         result = run_agent(default_agent, GREEN_AGENT_URL)
         result_json = json.dumps(result, cls=NumpyEncoder)
@@ -196,7 +208,7 @@ def get_agent_status(agent_id: str):
 def agent_card_a2a():
     """Returns first agent's card for legacy compatibility."""
     from fastapi.responses import JSONResponse
-    default_agent = list(AGENTS.keys())[0]
+    default_agent = AGENT_ID
     return JSONResponse(content=get_agent_card(default_agent), media_type="application/json")
 
 @app.get("/agents/{agent_id}/.well-known/agent.json")
