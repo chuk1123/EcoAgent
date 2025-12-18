@@ -27,9 +27,6 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM
 
-# Clean up stale agent state to prevent errors
-rm -rf "${SCRIPT_DIR}/.ab"
-
 # Use the venv with earthshaker
 source "${SCRIPT_DIR}/venv-ctrl/bin/activate"
 
