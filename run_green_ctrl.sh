@@ -32,9 +32,17 @@ if [ -f "$TUNNEL_URL_FILE" ]; then
     # If we have agent_id, include proxy path
     if [ ! -z "$AGENT_ID" ]; then
         export PUBLIC_URL="${TUNNEL_URL}/to_agent/${AGENT_ID}"
+        export AGENT_URL="${TUNNEL_URL}/to_agent/${AGENT_ID}/"
     else
         export PUBLIC_URL="${TUNNEL_URL}"
+        export AGENT_URL="${TUNNEL_URL}/"
     fi
 fi
 
+# Fallback if no tunnel URL
+if [ -z "$AGENT_URL" ]; then
+    export AGENT_URL="http://${HOST:-0.0.0.0}:${AGENT_PORT:-8000}/"
+fi
+
+echo "Starting green agent with AGENT_URL=$AGENT_URL"
 python -m uvicorn ecoagent.green_agent.main:app --host ${HOST:-0.0.0.0} --port ${AGENT_PORT:-8000}

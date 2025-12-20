@@ -1,18 +1,21 @@
-WHITE_AGENT_ID = 'react-agent'
+"""White Agent - A2A Protocol compliant implementation using official SDK."""
 
-import os
-import sys
-import json
-import uuid
-import requests
-import pandas as pd
-import numpy as np
 import importlib
+import json
 import logging
+import os
 from importlib import import_module
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+
+import numpy as np
+import pandas as pd
+import uvicorn
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.events import EventQueue
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.types import AgentCapabilities, AgentCard, AgentSkill
+from a2a.utils import new_agent_text_message
 
 # Configure logging
 logging.basicConfig(
@@ -23,9 +26,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-AGENT_ID = "react-agent"
-
 class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types."""
     def default(self, obj):
         if isinstance(obj, np.integer):
             return int(obj)
@@ -37,98 +39,107 @@ class NumpyEncoder(json.JSONEncoder):
 
 
 class GreenAgentProxy:
-    def __init__(self, green_agent_url):
-        self.url = green_agent_url
+    """Proxy for communicating with the green agent via A2A protocol."""
 
-    def _send_command(self, action, args=None):
+    def __init__(self, green_agent_url: str):
+        self.url = green_agent_url
+        self._client = None
+        self._card = None
+
+    async def _get_client(self):
+        """Lazily initialize the A2A client."""
+        if self._client is None:
+            import httpx
+            from a2a.client import A2ACardResolver, A2AClient
+
+            httpx_client = httpx.AsyncClient(timeout=120.0)
+            resolver = A2ACardResolver(httpx_client=httpx_client, base_url=self.url)
+            self._card = await resolver.get_agent_card()
+            self._client = A2AClient(httpx_client=httpx_client, agent_card=self._card)
+        return self._client
+
+    async def _send_command_async(self, action: str, args: dict = None) -> dict:
+        """Send a command to the green agent via A2A protocol."""
+        import uuid
+
+        from a2a.types import (
+            Message,
+            MessageSendParams,
+            Part,
+            Role,
+            SendMessageRequest,
+            SendMessageSuccessResponse,
+            TextPart,
+        )
+
         command_json = json.dumps(
             {"action": action, "args": args or {}}, cls=NumpyEncoder
         )
 
-        payload = {"messages": [{"role": "user", "content": command_json}]}
-
-        # Log what we're sending to green agent
         logger.info(f">>> SENDING TO GREEN AGENT: action={action}, args={args or {}}")
 
+        client = await self._get_client()
+
+        message_id = uuid.uuid4().hex
+        params = MessageSendParams(
+            message=Message(
+                role=Role.user,
+                parts=[Part(root=TextPart(text=command_json))],
+                message_id=message_id,
+            )
+        )
+        request_id = uuid.uuid4().hex
+        req = SendMessageRequest(id=request_id, params=params)
+
+        response = await client.send_message(request=req)
+
+        # Extract the response text
+        res_root = response.root
+        if isinstance(res_root, SendMessageSuccessResponse):
+            res_result = res_root.result
+            # Handle both Message and Task responses
+            if hasattr(res_result, 'parts'):
+                # It's a Message
+                from a2a.utils import get_text_parts
+                text_parts = get_text_parts(res_result.parts)
+                if text_parts:
+                    content = text_parts[0]
+                    try:
+                        data = json.loads(content)
+                        logger.info(f"<<< RECEIVED FROM GREEN AGENT: {json.dumps(data, cls=NumpyEncoder)[:200]}...")
+                        return data
+                    except json.JSONDecodeError:
+                        return {"raw": content}
+        
+        raise RuntimeError(f"Unexpected response from green agent: {response}")
+
+    def _send_command(self, action: str, args: dict = None) -> dict:
+        """Synchronous wrapper for sending commands."""
+        import asyncio
         try:
-            response = requests.post(f"{self.url}/v1/chat/completions", json=payload)
-            response.raise_for_status()
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        return loop.run_until_complete(self._send_command_async(action, args))
 
-            response_data = response.json()
-            content = response_data["choices"][0]["message"]["content"]
-
-            try:
-                data = json.loads(content)
-                # Log what we received from green agent
-                if action == "request_dataset":
-                    # For datasets, just log summary info
-                    if isinstance(data, dict) and "columns" in data:
-                        logger.info(
-                            f"<<< RECEIVED FROM GREEN AGENT: dataset with {len(data.get('data', []))} rows, columns={data.get('columns', [])}"
-                        )
-                    else:
-                        logger.info(
-                            f"<<< RECEIVED FROM GREEN AGENT: {json.dumps(data, cls=NumpyEncoder)[:200]}..."
-                        )
-                else:
-                    logger.info(
-                        f"<<< RECEIVED FROM GREEN AGENT: {json.dumps(data, cls=NumpyEncoder)[:500]}"
-                    )
-                if isinstance(data, dict) and "error" in data:
-                    raise RuntimeError(data["error"])
-                return data
-            except json.JSONDecodeError:
-                logger.info(f"<<< RECEIVED FROM GREEN AGENT (raw): {content[:200]}...")
-                return content
-        except Exception as e:
-            logger.error(f"<<< ERROR from GREEN AGENT: {e}")
-            raise RuntimeError(f"GreenAgent Communication Error: {e}")
-
-    def describe(self):
+    def describe(self) -> dict:
         return self._send_command("describe")
 
-    def request_dataset(self, ds_id, split="train"):
-        json_data = self._send_command(
-            "request_dataset", {"ds_id": ds_id, "split": split}
-        )
+    def request_dataset(self, ds_id: str, split: str = "train") -> pd.DataFrame:
+        json_data = self._send_command("request_dataset", {"ds_id": ds_id, "split": split})
         return pd.read_json(json.dumps(json_data), orient="split")
 
-    def evaluate_predictions(self, y_pred):
+    def evaluate_predictions(self, y_pred) -> dict:
         return self._send_command("evaluate_predictions", {"y_pred": y_pred})
 
 
-app = FastAPI()
-
-# Add CORS middleware for AgentBeats platform
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-GREEN_AGENT_URL = os.getenv("GREEN_AGENT_URL")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:9001")
-
-# =============================================================================
-# Available agents
-# =============================================================================
+# Available agent implementations
 AGENTS = {
-    "linear-regression": {
-        "module": "ecoagent.white_agents.two_feature_regression",
-        "name": "Linear Regression Agent",
-        "description": "Uses sklearn LinearRegression with median listing price as feature.",
-    },
-    "naive-last-value": {
-        "module": "ecoagent.white_agents.naive_last_value",
-        "name": "Naive Last Value Agent",
-        "description": "Simple baseline that predicts the last observed training value.",
-    },
     "react-agent": {
         "module": "ecoagent.white_agents.react_agent",
         "name": "React Agent",
-        "description": "ReAct-based reasoning agent that uses LLM for decision making.",
+        "description": "Uses React-style reasoning to solve tasks.",
     },
     "plan-execute-agent": {
         "module": "ecoagent.white_agents.plan_execute_agent",
@@ -140,277 +151,135 @@ AGENTS = {
         "name": "Oracle Agent",
         "description": "Returns the ground truth value directly.",
     },
+    "linear-regression": {
+        "module": "ecoagent.white_agents.two_feature_regression",
+        "name": "Linear Regression Agent",
+        "description": "Uses sklearn LinearRegression with median listing price as feature.",
+    },
+    "naive-last-value": {
+        "module": "ecoagent.white_agents.naive_last_value",
+        "name": "Naive Last Value Agent",
+        "description": "Simple baseline that predicts the last observed training value.",
+    },
 }
 
-
-def run_agent(agent_id: str, green_agent_url: str):
-    """Run a specific agent and return results."""
-    if agent_id not in AGENTS:
-        raise ValueError(f"Unknown agent: {agent_id}")
-
-    proxy = GreenAgentProxy(green_agent_url)
-    agent_module = import_module(AGENTS[agent_id]["module"])
-    importlib.reload(agent_module)
-    return agent_module.run(proxy)
+# Default agent to use
+DEFAULT_AGENT_ID = os.getenv("AGENT_ID", "oracle-agent")
 
 
-def get_agent_card(agent_id: str = None):
-    """Generate agent card for a specific agent."""
+def prepare_agent_card(url: str, agent_id: str = None) -> AgentCard:
+    """Create the agent card for the white agent."""
     if agent_id is None:
-        agent_id = list(AGENTS.keys())[0]
-    agent = AGENTS[agent_id]
-    return {
-        "name": agent["name"],
-        "version": "1.0.0",
-        "protocolVersion": "0.3.0",
-        "description": f"White Agent for EcoAgent (A2A). {agent['description']}",
-        "url": f"{PUBLIC_URL}/",
-        "defaultInputModes": ["text"],
-        "defaultOutputModes": ["text"],
-        "skills": [],
-        "capabilities": {
-            "streaming": False,
-            "pushNotifications": False,
-            "stateTransitionHistory": False,
-        },
-    }
-
-
-# =============================================================================
-# A2A JSON-RPC Endpoint (POST to root)
-# =============================================================================
-@app.post("/")
-async def a2a_jsonrpc_handler(request: Request):
-    """Handle A2A JSON-RPC messages at the root URL."""
-    try:
-        data = await request.json()
-    except:
-        return JSONResponse(
-            content={
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32700, "message": "Parse error"},
-            },
-            status_code=400,
-        )
-
-    # Extract JSON-RPC fields
-    jsonrpc = data.get("jsonrpc", "2.0")
-    request_id = data.get("id")
-    method = data.get("method", "")
-    params = data.get("params", {})
-
-    # Handle message/send method (A2A protocol)
-    if method == "message/send":
-        # Run the default agent
-        default_agent = WHITE_AGENT_ID
-        try:
-            result = run_agent(default_agent, GREEN_AGENT_URL)
-            result_text = json.dumps(result, cls=NumpyEncoder)
-        except Exception as e:
-            result_text = json.dumps({"error": str(e)})
-
-        # Return A2A JSON-RPC response
-        return JSONResponse(
-            content={
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "message": {
-                        "messageId": str(uuid.uuid4()),
-                        "role": "agent",
-                        "parts": [{"kind": "text", "text": result_text}],
-                    }
-                },
-            }
-        )
-
-    # Unknown method
-    return JSONResponse(
-        content={
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"},
-        },
-        status_code=400,
+        agent_id = DEFAULT_AGENT_ID
+    
+    agent_info = AGENTS.get(agent_id, AGENTS[DEFAULT_AGENT_ID])
+    
+    skill = AgentSkill(
+        id="housing_prediction",
+        name="Housing Price Prediction",
+        description=agent_info["description"],
+        tags=["white agent", "prediction", "housing", "forecasting"],
+        examples=[],
+    )
+    return AgentCard(
+        name=agent_info["name"],
+        description=f"White Agent for EcoAgent (A2A). {agent_info['description']}",
+        url=url,
+        version="1.0.0",
+        default_input_modes=["text/plain"],
+        default_output_modes=["text/plain"],
+        capabilities=AgentCapabilities(),
+        skills=[skill],
     )
 
 
-# =============================================================================
-# Per-agent A2A JSON-RPC endpoint
-# =============================================================================
-@app.post("/agents/{agent_id}/")
-async def agent_a2a_handler(agent_id: str, request: Request):
-    """Handle A2A JSON-RPC messages for a specific agent."""
-    if agent_id not in AGENTS:
-        return JSONResponse(
-            content={
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32602, "message": f"Unknown agent: {agent_id}"},
-            },
-            status_code=404,
-        )
+class WhiteAgentExecutor(AgentExecutor):
+    """Executor that handles incoming A2A messages for the white agent."""
 
-    try:
-        data = await request.json()
-    except:
-        return JSONResponse(
-            content={
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32700, "message": "Parse error"},
-            },
-            status_code=400,
-        )
+    def __init__(self, agent_id: str = None):
+        self.agent_id = agent_id or DEFAULT_AGENT_ID
+        self.green_agent_url = os.getenv("GREEN_AGENT_URL")
 
-    request_id = data.get("id")
-    method = data.get("method", "")
+    def run_agent(self) -> dict:
+        """Run the configured agent and return results."""
+        if self.agent_id not in AGENTS:
+            raise ValueError(f"Unknown agent: {self.agent_id}")
 
-    if method == "message/send":
+        if not self.green_agent_url:
+            raise RuntimeError("GREEN_AGENT_URL environment variable not set")
+
+        proxy = GreenAgentProxy(self.green_agent_url)
+        agent_module = import_module(AGENTS[self.agent_id]["module"])
+        importlib.reload(agent_module)
+        return agent_module.run(proxy)
+
+    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        """Handle incoming A2A message."""
+        user_input = context.get_user_input()
+        logger.info(f"Received message: {user_input[:200] if user_input else 'empty'}...")
+
         try:
-            result = run_agent(agent_id, GREEN_AGENT_URL)
+            result = self.run_agent()
             result_text = json.dumps(result, cls=NumpyEncoder)
+            logger.info(f"Agent completed successfully: {result_text[:200]}...")
         except Exception as e:
+            logger.error(f"Agent error: {e}")
             result_text = json.dumps({"error": str(e)})
 
-        return JSONResponse(
-            content={
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "message": {
-                        "messageId": str(uuid.uuid4()),
-                        "role": "agent",
-                        "parts": [{"kind": "text", "text": result_text}],
-                    }
-                },
-            }
+        # Send response using proper A2A format
+        await event_queue.enqueue_event(
+            new_agent_text_message(result_text, context_id=context.context_id)
         )
 
-    return JSONResponse(
-        content={
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"},
-        },
-        status_code=400,
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+        """Handle cancellation request."""
+        raise NotImplementedError("Cancel not implemented")
+
+
+def create_app(agent_id: str = None):
+    """Create and configure the A2A application."""
+    if agent_id is None:
+        agent_id = DEFAULT_AGENT_ID
+
+    # Get the agent URL from environment
+    agent_url = os.getenv("AGENT_URL", os.getenv("PUBLIC_URL", "http://localhost:9001"))
+    
+    # Ensure URL ends with /
+    if not agent_url.endswith("/"):
+        agent_url = agent_url + "/"
+
+    logger.info(f"Creating white agent '{agent_id}' with URL: {agent_url}")
+
+    # Create agent card
+    agent_card = prepare_agent_card(agent_url, agent_id)
+
+    # Create request handler with our executor
+    request_handler = DefaultRequestHandler(
+        agent_executor=WhiteAgentExecutor(agent_id),
+        task_store=InMemoryTaskStore(),
     )
 
+    # Create A2A application
+    a2a_app = A2AStarletteApplication(
+        agent_card=agent_card,
+        http_handler=request_handler,
+    )
 
-# =============================================================================
-# OpenAI-style chat completions (legacy)
-# =============================================================================
-@app.post("/agents/{agent_id}/v1/chat/completions")
-async def agent_chat(agent_id: str, request: Request):
-    if agent_id not in AGENTS:
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps({"error": f"Unknown agent: {agent_id}"})
-                    }
-                }
-            ]
-        }
-
-    try:
-        result = run_agent(agent_id, GREEN_AGENT_URL)
-        result_json = json.dumps(result, cls=NumpyEncoder)
-        return {"choices": [{"message": {"content": result_json}}]}
-    except Exception as e:
-        print(f"Error in {agent_id} execution: {e}")
-        return {"choices": [{"message": {"content": json.dumps({"error": str(e)})}}]}
+    return a2a_app.build()
 
 
-@app.post("/v1/chat/completions")
-async def start_assessment(request: Request):
-    default_agent = AGENT_ID
-    try:
-        result = run_agent(default_agent, GREEN_AGENT_URL)
-        result_json = json.dumps(result, cls=NumpyEncoder)
-        return {"choices": [{"message": {"content": result_json}}]}
-    except Exception as e:
-        print(f"Error in white agent execution: {e}")
-        return {"choices": [{"message": {"content": json.dumps({"error": str(e)})}}]}
+# Create the app instance for uvicorn
+app = create_app()
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+def start_white_agent(agent_id: str = None, host: str = "0.0.0.0", port: int = 9001):
+    """Start the white agent server."""
+    application = create_app(agent_id)
+    uvicorn.run(application, host=host, port=port)
 
 
-@app.get("/status")
-def status():
-    return {"status": "ok"}
-
-
-# =============================================================================
-# AgentBeats controller endpoints - list ALL agents
-# =============================================================================
-@app.get("/agents")
-def list_agents():
-    result = {}
-    for agent_id in AGENTS:
-        result[agent_id] = {
-            "id": agent_id,
-            "name": AGENTS[agent_id]["name"],
-            "url": f"{PUBLIC_URL}/agents/{agent_id}",
-            "status": "ready",
-            "ready": True,
-            "agent_card": get_agent_card(agent_id),
-        }
-    return result
-
-
-@app.get("/agents/{agent_id}")
-def get_agent_status(agent_id: str):
-    if agent_id not in AGENTS:
-        return {"error": f"Unknown agent: {agent_id}"}
-
-    return {
-        "id": agent_id,
-        "name": AGENTS[agent_id]["name"],
-        "url": f"{PUBLIC_URL}/agents/{agent_id}",
-        "status": "ready",
-        "ready": True,
-        "agent_card": get_agent_card(agent_id),
-    }
-
-
-# =============================================================================
-# A2A Protocol agent cards
-# =============================================================================
-@app.get("/.well-known/agent.json")
-def agent_card_a2a():
-    """Returns first agent's card for legacy compatibility."""
-    default_agent = AGENT_ID
-    return JSONResponse(content=get_agent_card(default_agent), media_type="application/json")
-
-
-@app.get("/.well-known/agent-card.json")
-def agent_card_legacy():
-    """Returns first agent's card (legacy path)."""
-    return JSONResponse(content=get_agent_card(), media_type="application/json")
-
-
-@app.get("/agents/{agent_id}/.well-known/agent.json")
-def agent_card_by_id(agent_id: str):
-    if agent_id not in AGENTS:
-        return JSONResponse(
-            content={"error": f"Unknown agent: {agent_id}"}, status_code=404
-        )
-    return JSONResponse(content=get_agent_card(agent_id), media_type="application/json")
-
-
-# =============================================================================
-# Reset endpoints
-# =============================================================================
-@app.post("/reset")
-def reset_agent():
-    return {"status": "ok", "message": "All agents reset successfully"}
-
-
-@app.post("/agents/{agent_id}/reset")
-def reset_agent_by_id(agent_id: str):
-    return {"status": "ok", "agent_id": agent_id, "message": "Agent reset successfully"}
+if __name__ == "__main__":
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("AGENT_PORT", os.getenv("PORT", "9001")))
+    agent_id = os.getenv("AGENT_ID", DEFAULT_AGENT_ID)
+    start_white_agent(agent_id=agent_id, host=host, port=port)
