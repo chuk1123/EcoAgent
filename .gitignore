@@ -7,4 +7,5 @@ venv-ctrl/
 .DS_Store
 *.log
 .ab/
+.state/
 

@@ -35,9 +35,12 @@ source "${SCRIPT_DIR}/venv-ctrl/bin/activate"
 # Set environment variables
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
-# Create symlink for run.sh that agentbeats expects
-ln -sf run_white_ctrl.sh run.sh
-chmod +x run.sh
+# Create state directory with run.sh symlink
+STATE_DIR="${SCRIPT_DIR}/.state/white"
+mkdir -p "$STATE_DIR"
+rm -rf "$STATE_DIR/.ab"  # Clean stale state for this controller only
+ln -sf "${SCRIPT_DIR}/run_white_ctrl.sh" "$STATE_DIR/run.sh"
+chmod +x "$STATE_DIR/run.sh"
 
 # Start cloudflared tunnel FIRST to get the URL
 echo "🌐 Starting Cloudflare tunnel..."
@@ -72,10 +75,14 @@ echo "🔗 Tunnel URL: $TUNNEL_URL"
 export CLOUDRUN_HOST="$TUNNEL_HOST"
 export HTTPS_ENABLED=true
 
-# Start the AgentBeats controller on different port
+# Write tunnel URL to file so run script can read it
+echo "$TUNNEL_URL" > "${SCRIPT_DIR}/.state/white/tunnel_url"
+
+# Start the AgentBeats controller from its own state directory
 echo "📦 Starting AgentBeats Controller on port $CTRL_PORT..."
-PORT=$CTRL_PORT "${SCRIPT_DIR}/venv-ctrl/bin/agentbeats" run_ctrl &
+cd "$STATE_DIR" && PORT=$CTRL_PORT "${SCRIPT_DIR}/venv-ctrl/bin/agentbeats" run_ctrl &
 CTRL_PID=$!
+cd "${SCRIPT_DIR}"
 
 # Wait for controller to start
 sleep 5
