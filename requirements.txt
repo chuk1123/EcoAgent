@@ -11,7 +11,7 @@ httpx
 flask
 
 # A2A SDK for AgentBeats compatibility
-a2a-sdk
+a2a-sdk[http-server]
 
 langchain-openai
 langchain-anthropic
