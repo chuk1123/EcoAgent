@@ -134,7 +134,13 @@ class GreenAgentExecutor(AgentExecutor):
                 logger.info("Received initialization message. Starting orchestration...")
                 
                 participants = data.get("participants", {})
-                target_url = list(participants.values())[0] if participants else None
+                
+                target_id = None
+                target_url = None
+                
+                if participants:
+                    target_id = list(participants.keys())[0]   # Get the ID (e.g., "ecoagent-naive-last-value")
+                    target_url = participants[target_id]
                 
                 if not target_url:
                     raise ValueError("No participant URLs found in initialization message")
@@ -179,6 +185,13 @@ class GreenAgentExecutor(AgentExecutor):
                     # Fallback if extraction failed (e.g. non-standard response)
                     if result_text == "{}":
                          result_text = json.dumps(res_root.model_dump() if hasattr(res_root, 'model_dump') else str(res_root))
+
+                    try:
+                        result_json = json.loads(result_text)
+                        result_json["id"] = target_id  # Associate score with the agent ID
+                        result_text = json.dumps(result_json)
+                    except json.JSONDecodeError:
+                        logger.warning("Result was not valid JSON, could not inject ID")
 
                     logger.info(f"Assessment complete. Result: {result_text[:100]}...")
 
