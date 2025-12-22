@@ -12,4 +12,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 9000
 
-CMD ["python", "-m", "ecoagent.green_agent.main"]
+ENTRYPOINT ["python", "-m", "ecoagent.green_agent.main"]

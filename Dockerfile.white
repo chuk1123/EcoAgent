@@ -12,4 +12,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 9001
 
-CMD ["python", "-m", "ecoagent.white_agents.main"]
+ENTRYPOINT ["python", "-m", "ecoagent.white_agents.main"]
