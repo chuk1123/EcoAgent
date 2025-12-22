@@ -1,5 +1,6 @@
 """White Agent - A2A Protocol compliant implementation using official SDK."""
 
+import asyncio
 import importlib
 import json
 import logging
@@ -219,7 +220,7 @@ class WhiteAgentExecutor(AgentExecutor):
         logger.info(f"Received message: {user_input[:200] if user_input else 'empty'}...")
 
         try:
-            result = self.run_agent()
+            result = await asyncio.to_thread(self.run_agent)
             result_text = json.dumps(result, cls=NumpyEncoder)
             logger.info(f"Agent completed successfully: {result_text[:200]}...")
         except Exception as e:

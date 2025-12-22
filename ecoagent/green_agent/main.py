@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import uuid
+import httpx
 
 import uvicorn
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -12,6 +14,18 @@ from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 from a2a.utils import new_agent_text_message
+
+from a2a.client import A2ACardResolver, A2AClient
+from a2a.types import (
+    Message,
+    MessageSendParams,
+    Part,
+    Role,
+    SendMessageRequest,
+    TextPart,
+    SendMessageSuccessResponse
+)
+from a2a.utils import get_text_parts
 
 from ecoagent.green_agent.green_agent import GreenAgent
 
@@ -68,7 +82,8 @@ class GreenAgentExecutor(AgentExecutor):
         action = command.get("action")
         args = command.get("args", {})
 
-        logger.info(f"<<< RECEIVED FROM WHITE AGENT: action={action}, args={args}")
+        if action:
+            logger.info(f"<<< RECEIVED FROM WHITE AGENT: action={action}, args={args}")
 
         if action == "describe":
             info = self.green_agent.describe()
@@ -112,10 +127,77 @@ class GreenAgentExecutor(AgentExecutor):
         user_input = context.get_user_input()
         logger.info(f"Received message: {user_input[:200]}...")
 
-        # Process the command
-        result_text = self.process_command(user_input)
+        try:
+            data = json.loads(user_input)
+            
+            if "participants" in data:
+                logger.info("Received initialization message. Starting orchestration...")
+                
+                participants = data.get("participants", {})
+                target_url = list(participants.values())[0] if participants else None
+                
+                if not target_url:
+                    raise ValueError("No participant URLs found in initialization message")
 
-        # Send response using proper A2A format
+                logger.info(f"Triggering White Agent at {target_url}")
+
+                async with httpx.AsyncClient(timeout=300.0) as httpx_client:
+                    # Resolve the agent card (Handshake)
+                    resolver = A2ACardResolver(httpx_client=httpx_client, base_url=target_url)
+                    card = await resolver.get_agent_card()
+                    
+                    # Create the client
+                    client = A2AClient(httpx_client=httpx_client, agent_card=card)
+                    
+                    # Prepare the message
+                    msg_id = uuid.uuid4().hex
+                    req_id = uuid.uuid4().hex
+                    
+                    params = MessageSendParams(
+                        message=Message(
+                            role=Role.user,
+                            parts=[Part(root=TextPart(text="Start Assessment"))],
+                            message_id=msg_id,
+                        )
+                    )
+                    
+                    req = SendMessageRequest(id=req_id, params=params)
+                    
+                    # Send and await response
+                    response = await client.send_message(request=req)
+                    
+                    res_root = response.root
+                    result_text = "{}"
+                    
+                    if isinstance(res_root, SendMessageSuccessResponse):
+                        res_result = res_root.result
+                        if hasattr(res_result, 'parts'):
+                            text_parts = get_text_parts(res_result.parts)
+                            if text_parts:
+                                result_text = text_parts[0]
+                    
+                    # Fallback if extraction failed (e.g. non-standard response)
+                    if result_text == "{}":
+                         result_text = json.dumps(res_root.model_dump() if hasattr(res_root, 'model_dump') else str(res_root))
+
+                    logger.info(f"Assessment complete. Result: {result_text[:100]}...")
+
+                    await event_queue.enqueue_event(
+                        new_agent_text_message(result_text, context_id=context.context_id)
+                    )
+                    return
+
+        except json.JSONDecodeError:
+            pass
+        except Exception as e:
+            logger.error(f"Orchestration failed: {e}")
+            await event_queue.enqueue_event(
+                new_agent_text_message(json.dumps({"error": str(e)}), context_id=context.context_id)
+            )
+            return
+
+        # Standard processing
+        result_text = self.process_command(user_input)
         await event_queue.enqueue_event(
             new_agent_text_message(result_text, context_id=context.context_id)
         )
@@ -127,25 +209,18 @@ class GreenAgentExecutor(AgentExecutor):
 
 def create_app():
     """Create and configure the A2A application."""
-    # Get the agent URL from environment
     agent_url = os.getenv("AGENT_URL", os.getenv("PUBLIC_URL", "http://localhost:9000"))
-    
-    # Ensure URL ends with /
     if not agent_url.endswith("/"):
         agent_url = agent_url + "/"
 
     logger.info(f"Creating green agent with URL: {agent_url}")
-
-    # Create agent card
     agent_card = prepare_agent_card(agent_url)
 
-    # Create request handler with our executor
     request_handler = DefaultRequestHandler(
         agent_executor=GreenAgentExecutor(),
         task_store=InMemoryTaskStore(),
     )
 
-    # Create A2A application
     a2a_app = A2AStarletteApplication(
         agent_card=agent_card,
         http_handler=request_handler,
@@ -153,16 +228,11 @@ def create_app():
 
     return a2a_app.build()
 
-
-# Create the app instance for uvicorn
-# Note: Environment variables should be set before importing this module
 app = create_app()
-
 
 def start_green_agent(host: str = "0.0.0.0", port: int = 9000):
     """Start the green agent server."""
     uvicorn.run(app, host=host, port=port)
-
 
 if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
