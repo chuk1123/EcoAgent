@@ -115,6 +115,7 @@ class GreenAgent:
             "datasets_used": self.budget.used,
             "eff_bonus": round(eff_bonus, 5),
             "final_score": round(final, 5),
+            "score": round(final, 5),
             "predictions": y_pred.tolist(),
             "true_values": y_true.tolist(),
         }

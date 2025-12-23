@@ -11,9 +11,9 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.apps import A2AStarletteApplication
 from a2a.server.events import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore
-from a2a.types import AgentCapabilities, AgentCard, AgentSkill
-from a2a.utils import new_agent_text_message
+from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+from a2a.types import AgentCapabilities, AgentCard, AgentSkill, Part, TextPart
+from a2a.utils import new_agent_text_message, new_task, get_text_parts
 
 from a2a.client import A2ACardResolver, A2AClient
 from a2a.types import (
@@ -127,38 +127,52 @@ class GreenAgentExecutor(AgentExecutor):
         user_input = context.get_user_input()
         logger.info(f"Received message: {user_input[:200]}...")
 
+        # Try to parse as JSON to detect top-level "participants" messages
         try:
             data = json.loads(user_input)
-            
-            if "participants" in data:
+        except json.JSONDecodeError:
+            data = None
+
+        if isinstance(data, dict) and "participants" in data:
+            try:
                 logger.info("Received initialization message. Starting orchestration...")
-                
+
                 participants = data.get("participants", {})
-                
+
                 target_id = None
                 target_url = None
-                
+
                 if participants:
-                    target_id = list(participants.keys())[0]   # Get the ID (e.g., "ecoagent-naive-last-value")
+                    target_id = list(participants.keys())[0]
                     target_url = participants[target_id]
-                
+
                 if not target_url:
                     raise ValueError("No participant URLs found in initialization message")
 
                 logger.info(f"Triggering White Agent at {target_url}")
 
+                task = context.current_task
+                if not task:
+                    task = new_task(context.message)
+                    await event_queue.enqueue_event(task)
+
+                updater = TaskUpdater(event_queue, task.id, task.context_id)
+
                 async with httpx.AsyncClient(timeout=300.0) as httpx_client:
-                    # Resolve the agent card (Handshake)
                     resolver = A2ACardResolver(httpx_client=httpx_client, base_url=target_url)
                     card = await resolver.get_agent_card()
-                    
+                    logger.info(
+                        f"Successfully fetched agent card data from {target_url}: "
+                        f"{getattr(card, 'model_dump', lambda: card)()}"
+                    )
+
                     # Create the client
                     client = A2AClient(httpx_client=httpx_client, agent_card=card)
-                    
-                    # Prepare the message
+
+                    # Prepare the message to start assessment
                     msg_id = uuid.uuid4().hex
                     req_id = uuid.uuid4().hex
-                    
+
                     params = MessageSendParams(
                         message=Message(
                             role=Role.user,
@@ -166,53 +180,63 @@ class GreenAgentExecutor(AgentExecutor):
                             message_id=msg_id,
                         )
                     )
-                    
+
                     req = SendMessageRequest(id=req_id, params=params)
-                    
+
                     # Send and await response
                     response = await client.send_message(request=req)
-                    
-                    res_root = response.root
-                    result_text = "{}"
-                    
-                    if isinstance(res_root, SendMessageSuccessResponse):
-                        res_result = res_root.result
-                        if hasattr(res_result, 'parts'):
-                            text_parts = get_text_parts(res_result.parts)
-                            if text_parts:
-                                result_text = text_parts[0]
-                    
-                    # Fallback if extraction failed (e.g. non-standard response)
-                    if result_text == "{}":
-                         result_text = json.dumps(res_root.model_dump() if hasattr(res_root, 'model_dump') else str(res_root))
 
-                    try:
-                        result_json = json.loads(result_text)
-                        result_json["id"] = target_id  # Associate score with the agent ID
+                res_root = response.root
+                result_text = "{}"
+
+                if isinstance(res_root, SendMessageSuccessResponse):
+                    res_result = res_root.result
+                    if hasattr(res_result, "parts"):
+                        text_parts = get_text_parts(res_result.parts)
+                        if text_parts:
+                            result_text = text_parts[0]
+
+                # Fallback if extraction failed
+                if result_text == "{}":
+                    if hasattr(res_root, "model_dump"):
+                        result_text = json.dumps(res_root.model_dump())
+                    else:
+                        result_text = json.dumps(str(res_root))
+
+                try:
+                    result_json = json.loads(result_text)
+                    if isinstance(result_json, dict):
+                        result_json["id"] = target_id
                         result_text = json.dumps(result_json)
-                    except json.JSONDecodeError:
-                        logger.warning("Result was not valid JSON, could not inject ID")
+                except json.JSONDecodeError:
+                    logger.warning("Result was not valid JSON, could not inject ID")
 
-                    logger.info(f"Assessment complete. Result: {result_text[:100]}...")
+                logger.info(f"Assessment complete. Result: {result_text[:100]}...")
 
-                    await event_queue.enqueue_event(
-                        new_agent_text_message(result_text, context_id=context.context_id)
+                await updater.add_artifact(
+                    [Part(root=TextPart(text=result_text))],
+                    name="evaluation_result",
+                )
+                await updater.complete()
+                return
+
+            except Exception as e:
+                logger.error(f"Orchestration failed: {e}")
+                await event_queue.enqueue_event(
+                    new_agent_text_message(
+                        json.dumps({"error": str(e)}),
+                        context_id=context.context_id,
                     )
-                    return
+                )
+                return
 
-        except json.JSONDecodeError:
-            pass
-        except Exception as e:
-            logger.error(f"Orchestration failed: {e}")
-            await event_queue.enqueue_event(
-                new_agent_text_message(json.dumps({"error": str(e)}), context_id=context.context_id)
-            )
-            return
-
-        # Standard processing
         result_text = self.process_command(user_input)
+
         await event_queue.enqueue_event(
-            new_agent_text_message(result_text, context_id=context.context_id)
+            new_agent_text_message(
+                result_text,
+                context_id=context.context_id,
+            )
         )
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
